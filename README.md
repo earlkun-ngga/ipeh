@@ -10,5 +10,5 @@ Req:
 Menu 1-2 itu cocok untuk AlmaLinux dan terpasang Cpanel/WHM.
 
 Cara pakai:
-bash -n ipeh.sh (pas pertama kali clone / download aja)
-bash ipeh.sh
+- bash -n ipeh.sh (pas pertama kali clone / download aja)
+- bash ipeh.sh
