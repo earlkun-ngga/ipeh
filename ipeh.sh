@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inspektorat PHP (IPEH) - WHM security & cross-Linux PHP inventory - read-only
+# Inspektorat PHP (IPEH) v1.2 - WHM + Linux PHP inventory and passive CVE triage - read-only
 # CVE-2026-109618 / CVE-2026-109619, official cPanel advisory 2026-10-21
 # Bash 4+; requires rpm, awk, grep, find, sort, coreutils
 set -u
@@ -346,10 +346,102 @@ linux_php_inventory() {
   printf '  Menu 3 hanya inventaris versi/runtime, bukan verifikasi patch CVE.\n'
   printf '  Read-only: tidak menginstal paket, mengubah konfigurasi, ataupun restart service.\n'
 }
+# Passive, read-only triage for PHP2Shell. Not an exploit probe or a proof of compromise.
+compromise_scan() {
+  local since=${1:-2026-10-17} days=0 scanned=0 found=0 warnings=0 unknown=0
+  local file line matches count readable=0 accessn=0 errn=0 fhits=0 hits=0
+  local -a access_logs=() error_logs=() scan_dirs=()
+  heading 'MENU 4 | PHP2SHELL COMPROMISE TRIAGE (PASIF / READ ONLY)'
+  printf 'CVE-2026-109618 / CVE-2026-109619 | Host: %s\n' "$HOST"
+  printf 'Periode analisis file/log: sejak %s (berdasarkan mtime; isi log tidak difilter tanggal)\n' "$since"
+  printf 'Tidak mengirim request eksploitasi, tidak membunuh proses, tidak memodifikasi file.\n'
+  if [[ $EUID -ne 0 ]]; then printf '%b[!] Jalankan sebagai root untuk cakupan log yang lebih lengkap.%b\n' "$YELLOW" "$RESET"; ((unknown+=1)); fi
+  if ! date -d "$since" +%s >/dev/null 2>&1; then printf 'ERROR: tanggal harus YYYY-MM-DD.\n' >&2; return 2; fi
+
+  # Use access logs only where there is evidence in URL/headers; POST bodies are usually absent.
+  printf '\n%b[A] HTTP ACCESS LOG - upload/session probes (maks 20 contoh)%b\n' "$BOLD" "$RESET"
+  for file in /etc/apache2/logs/access_log /usr/local/apache/logs/access_log /var/log/httpd/access_log /var/log/apache2/access.log /var/log/nginx/access.log; do
+    [[ -f $file && -r $file && $file -nt /dev/null ]] && access_logs+=("$file")
+  done
+  if [[ -d /etc/apache2/logs/domlogs ]]; then
+    while IFS= read -r -d '' file; do access_logs+=("$file"); done < <(find /etc/apache2/logs/domlogs -maxdepth 1 -type f ! -name '*bytes_log*' -newermt "$since" -print0 2>/dev/null | head -z -n 100)
+  fi
+  # Bound work per log via tail; do not process all historical traffic.
+  for file in "${access_logs[@]}"; do
+    [[ -r $file ]] || continue
+    ((accessn+=1))
+    matches=$(tail -n 12000 "$file" 2>/dev/null | grep -Ei 'PHP_SESSION_UPLOAD_PROGRESS|session\.upload_progress|php2shell|(%5[fF]|_)SESSION_UPLOAD_PROGRESS' | head -n 3 || true)
+    if [[ -n $matches ]]; then
+      ((hits+=1)); printf '%b[!] %s: upload-progress / php2shell token di HTTP log%b\n' "$YELLOW" "$file" "$RESET"
+      printf '%s\n' "$matches" | cut -c 1-260
+    fi
+  done
+  if (( accessn == 0 )); then printf '[?] Tidak ada access log yang terbaca dalam lokasi umum.\n'; ((unknown+=1));
+  elif (( hits == 0 )); then printf '%b[✓] Tidak ada token URL/header terkait pada %d access log yang diperiksa.%b\n' "$GREEN" "$accessn" "$RESET"; fi
+  ((warnings+=hits))
+  printf '    Catatan: body multipart biasanya tidak disimpan di access log; hasil negatif BUKAN bukti aman.\n'
+
+  printf '\n%b[B] PHP / WEB ERRORS & CRASH (maks 15 contoh)%b\n' "$BOLD" "$RESET"
+  for file in /etc/apache2/logs/error_log /usr/local/apache/logs/error_log /var/log/httpd/error_log /var/log/apache2/error.log /var/log/nginx/error.log /var/log/php-fpm/error.log /var/log/php*-fpm.log; do
+    [[ -f $file && -r $file ]] && error_logs+=("$file")
+  done
+  hits=0
+  for file in "${error_logs[@]}"; do
+    ((errn+=1))
+    matches=$(tail -n 15000 "$file" 2>/dev/null | grep -Ei 'Allowed memory size.*exhausted|Out of memory|segmentation fault|SIGSEGV|zend_mm_heap corrupted|double free|malloc.*corrupt|child.*exited on signal 11' | tail -n 3 || true)
+    if [[ -n $matches ]]; then
+      ((hits+=1)); printf '%b[!] %s: OOM/crash/memory error%b\n' "$YELLOW" "$file" "$RESET"
+      printf '%s\n' "$matches" | cut -c 1-260
+    fi
+  done
+  if (( errn == 0 )); then printf '[?] Error log umum tidak terbaca.\n'; ((unknown+=1));
+  elif (( hits == 0 )); then printf '%b[✓] Tidak ada crash/OOM pada sampel %d error log.%b\n' "$GREEN" "$errn" "$RESET"; fi
+  ((warnings+=hits))
+  if command -v journalctl >/dev/null 2>&1; then
+    matches=$(journalctl --since "$since" --no-pager -q -p warning..emerg 2>/dev/null | grep -Ei 'php|httpd|apache|nginx|lsphp' | grep -Ei 'oom|segfault|SIGSEGV|killed process|memory' | tail -n 5 || true)
+    if [[ -n $matches ]]; then printf '%b[!] Journal: indikasi OOM/crash web/PHP%b\n%s\n' "$YELLOW" "$RESET" "$matches"; ((warnings+=1)); fi
+  fi
+
+  printf '\n%b[C] PROSES ANAK SHELL DARI WEB/PHP (snapshot)%b\n' "$BOLD" "$RESET"
+  # Snapshot, not historical proof. Report only process tree edges that are suspicious.
+  if command -v ps >/dev/null 2>&1; then
+    matches=$(ps -eo pid=,ppid=,comm=,args= 2>/dev/null | awk '
+      {pid=$1; ppid=$2; comm=$3; line=$0; c[pid]=comm; par[pid]=ppid; cmd[pid]=line}
+      END {for (pid in c) {p=par[pid]; if (c[pid] ~ /^(sh|bash|dash|curl|wget|python[0-9.]*)$/ && c[p] ~ /^(php|php-fpm|php-cgi|lsphp|httpd|apache2)$/) print cmd[pid] " [parent=" c[p] "]" }}' | head -n 15)
+    if [[ -n $matches ]]; then printf '%b[!] Anak shell/tools dari proses PHP/web:%b\n%s\n' "$YELLOW" "$RESET" "$matches"; ((warnings+=1));
+    else printf '%b[✓] Snapshot proses tidak menemukan pola anak shell tersebut.%b\n' "$GREEN" "$RESET"; fi
+  else printf '[?] ps tidak tersedia.\n'; ((unknown+=1)); fi
+
+  printf '\n%b[D] PHP FILE BARU/BERUBAH (maks 30; bukan bukti webshell)%b\n' "$BOLD" "$RESET"
+  if [[ -d /home ]]; then
+    matches=$(find /home -type f \( -iname '*.php' -o -iname '*.phtml' \) -newermt "$since" -printf '%TY-%Tm-%Td %TH:%TM %u %p\n' 2>/dev/null | head -n 30)
+    if [[ -n $matches ]]; then printf '%b[!] File PHP berubah sejak tanggal awal:%b\n%s\n' "$YELLOW" "$RESET" "$matches"; ((warnings+=1));
+    else printf '%b[✓] Tidak ada perubahan file PHP yang terlihat di /home.%b\n' "$GREEN" "$RESET"; fi
+  else printf '[?] /home tidak ada; docroot mungkin berbeda.\n'; ((unknown+=1)); fi
+  printf '    Bandingkan dengan deployment/update aplikasi resmi sebelum menetapkan insiden.\n'
+
+  printf '\n%b[E] PHP WEB PROCESS RESTART / OOM SYSTEM%b\n' "$BOLD" "$RESET"
+  if command -v journalctl >/dev/null 2>&1; then
+    matches=$(journalctl -k --since "$since" --no-pager -q 2>/dev/null | grep -Ei 'out of memory|oom-killer|killed process|segfault' | tail -n 8 || true)
+    if [[ -n $matches ]]; then printf '%b[!] Kernel OOM/segfault tercatat:%b\n%s\n' "$YELLOW" "$RESET" "$matches"; ((warnings+=1));
+    else printf '%b[✓] Tidak ada OOM/segfault pada kernel journal yang tersedia.%b\n' "$GREEN" "$RESET"; fi
+  else printf '[?] journalctl tidak tersedia.\n'; ((unknown+=1)); fi
+
+  printf '\n%s\n' "$SEP"
+  if (( warnings > 0 )); then
+    printf '%b[!] %d KELOMPOK TEMUAN PERLU INVESTIGASI LANJUT%b\n' "$YELLOW" "$warnings" "$RESET"
+  else
+    printf '%b[✓] TIDAK ADA INDIKATOR DITEMUKAN pada cakupan dan sampel pemeriksaan.%b\n' "$GREEN" "$RESET"
+  fi
+  if (( unknown > 0 )); then printf '%b[?] %d area tidak terverifikasi.%b\n' "$YELLOW" "$unknown" "$RESET"; fi
+  printf 'PENTING: Ini TRIAGE pasif, bukan deteksi definitif, tidak membuktikan host bersih atau CVE tidak exploitable.\n'
+  printf 'Untuk forensik, simpan log asli dan lakukan investigasi IR bila ada indikasi.\n'
+}
+
 menu() {
   local choice csv
   if [[ ! -t 0 ]]; then
-    printf 'Mode interaktif memerlukan terminal. Gunakan --patch, --domains [--csv FILE], atau --linux.\n' >&2
+    printf 'Mode interaktif memerlukan terminal. Gunakan --patch, --domains [--csv FILE], atau --linux / --compromise.\n' >&2
     return 2
   fi
   while :; do
@@ -363,8 +455,9 @@ menu() {
     printf ' %s[1]%s Check php2shell Version & Patch Status\n' "$CYAN" "$RESET"
     printf ' %s[2]%s List Domain & PHP Version\n' "$CYAN" "$RESET"
     printf ' %s[3]%s Cek OS Linux dan PHP Terpasang/Terpakai\n' "$CYAN" "$RESET"
-    printf ' %s[4]%s Exit\n\n' "$CYAN" "$RESET"
-    printf ' Pilih menu [1-4]: '
+    printf ' %s[4]%s Scan Indikasi Kompromi PHP2Shell\n' "$CYAN" "$RESET"
+    printf ' %s[5]%s Exit\n\n' "$CYAN" "$RESET"
+    printf ' Pilih menu [1-5]: '
     read -r choice || return 0
     case "$choice" in
       1) check_patch; pause_screen;;
@@ -378,7 +471,8 @@ menu() {
          fi
          pause_screen;;
       3) linux_php_inventory; pause_screen;;
-      4) printf '\nSelesai. Tidak ada konfigurasi yang diubah.\n'; return 0;;
+      4) compromise_scan; pause_screen;;
+      5) printf '\nSelesai. Tidak ada konfigurasi yang diubah.\n'; return 0;;
       *) printf '%sPilihan tidak valid.%s\n' "$RED" "$RESET"; pause_screen;;
     esac
   done
@@ -391,7 +485,11 @@ case ${1:-} in
     elif [[ $# -eq 3 && $2 == --csv && -n $3 ]]; then list_domains "$3"
     else echo 'Usage: --domains [--csv /path/report.csv]' >&2; exit 2; fi;;
   --linux) [[ $# -eq 1 ]] || { echo 'Usage: --linux' >&2; exit 2; }; linux_php_inventory;;
+  --compromise)
+    if [[ $# -eq 1 ]]; then compromise_scan
+    elif [[ $# -eq 3 && $2 == --since ]]; then compromise_scan "$3"
+    else echo 'Usage: --compromise [--since YYYY-MM-DD]' >&2; exit 2; fi;;
   --help|-h)
-    printf 'Usage: %s [--patch | --domains [--csv FILE] | --linux | --help]\n' "$0";;
+    printf 'Usage: %s [--patch | --domains [--csv FILE] | --linux | --compromise [--since YYYY-MM-DD] | --help]\n' "$0";;
   *) echo 'Unknown option; use --help' >&2; exit 2;;
 esac
